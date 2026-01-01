@@ -35,7 +35,7 @@ from bpy.types import (
 # CACHE MANAGER - Core caching logic
 # ============================================================================
 
-class MDDCacheManager:
+class BB_MDDCacheManager:
     """Handles MDD file writing and frame caching"""
     
     def __init__(self, obj, cache_dir, frame_start, frame_end):
@@ -148,7 +148,7 @@ class MDDCacheManager:
 # DIRTY DETECTION - Track when cache needs rebuilding
 # ============================================================================
 
-class CacheDirtyTracker:
+class BB_CacheDirtyTracker:
     """Detect when animation data changes"""
     
     @staticmethod
@@ -214,7 +214,7 @@ class CacheDirtyTracker:
 # BACKGROUND WORKER - Handles idle-time baking
 # ============================================================================
 
-class BackgroundCacheWorker:
+class BB_BackgroundCacheWorker:
     """Global worker that bakes frames in the background"""
     
     def __init__(self):
@@ -246,7 +246,7 @@ class BackgroundCacheWorker:
         cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Create manager
-        manager = MDDCacheManager(
+        manager = BB_MDDCacheManager(
             obj,
             cache_dir,
             cache_settings.frame_start,
@@ -351,7 +351,7 @@ class BackgroundCacheWorker:
 
 
 # Global worker instance
-g_worker = BackgroundCacheWorker()
+g_worker = BB_BackgroundCacheWorker()
 
 
 # ============================================================================
@@ -411,7 +411,7 @@ def bake_object_cache(obj, context):
     settings.frame_end = scene_settings.frame_end if scene_settings.frame_end > 0 else context.scene.frame_end
     
     # Compute hash for dirty detection
-    settings.last_hash = CacheDirtyTracker.compute_hash(obj)
+    settings.last_hash = BB_CacheDirtyTracker.compute_hash(obj)
     
     # Start baking job
     g_worker.start_cache_job(obj)
@@ -423,7 +423,7 @@ def bake_object_cache(obj, context):
 # PROPERTY GROUP - Settings stored per object
 # ============================================================================
 
-class AnimCacheSettings(PropertyGroup):
+class BB_CacheSettings(PropertyGroup):
     """Per-object cache settings"""
     
     cache_path: StringProperty(
@@ -492,7 +492,7 @@ class AnimCacheSettings(PropertyGroup):
     )
 
 
-class BBCacheSceneSettings(PropertyGroup):
+class BB_CacheSceneSettings(PropertyGroup):
     """Scene-level cache settings"""
     
     cache_directory: StringProperty(
@@ -546,9 +546,9 @@ def toggle_cached_playback(settings, context):
 # OPERATORS
 # ============================================================================
 
-class ANIM_OT_bake_cache(Operator):
+class BB_OT_bake_cache(Operator):
     """Manually start baking cache"""
-    bl_idname = "anim.bake_cache"
+    bl_idname = "bb.bake_cache"
     bl_label = "Bake Cache"
     bl_description = "Start baking animation cache for this object"
     bl_options = {'REGISTER', 'UNDO'}
@@ -570,9 +570,9 @@ class ANIM_OT_bake_cache(Operator):
             return {'CANCELLED'}
 
 
-class ANIM_OT_clear_cache(Operator):
+class BB_OT_clear_cache(Operator):
     """Clear cache for this object"""
-    bl_idname = "anim.clear_cache"
+    bl_idname = "bb.clear_cache"
     bl_label = "Clear Cache"
     bl_description = "Remove cached files and reset state"
     bl_options = {'REGISTER', 'UNDO'}
@@ -626,9 +626,9 @@ class ANIM_OT_clear_cache(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_stop_cache(Operator):
+class BB_OT_stop_cache(Operator):
     """Stop currently running cache operation"""
-    bl_idname = "anim.stop_cache"
+    bl_idname = "bb.stop_cache"
     bl_label = "Stop Caching"
     bl_description = "Cancel the current cache baking operation"
     bl_options = {'REGISTER', 'UNDO'}
@@ -661,9 +661,9 @@ class ANIM_OT_stop_cache(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_set_playback_mode(Operator):
+class BB_OT_set_playback_mode(Operator):
     """Set playback mode (Live Rig or Cache)"""
-    bl_idname = "anim.set_playback_mode"
+    bl_idname = "bb.set_playback_mode"
     bl_label = "Set Playback Mode"
     bl_description = "Switch between live rig and cached playback"
     bl_options = {'REGISTER', 'UNDO'}
@@ -696,9 +696,9 @@ class ANIM_OT_set_playback_mode(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_sync_frame_range(Operator):
+class BB_OT_sync_frame_range(Operator):
     """Sync frame range from timeline"""
-    bl_idname = "anim.sync_frame_range"
+    bl_idname = "bb.sync_frame_range"
     bl_label = "Sync Frame Range"
     bl_description = "Set cache frame range to match timeline"
     bl_options = {'REGISTER', 'UNDO'}
@@ -720,9 +720,9 @@ class ANIM_OT_sync_frame_range(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_check_dirty(Operator):
+class BB_OT_check_dirty(Operator):
     """Check if cache is dirty"""
-    bl_idname = "anim.check_dirty"
+    bl_idname = "bb.check_dirty"
     bl_label = "Check Dirty"
     bl_description = "Check if animation has changed since last cache"
     bl_options = {'REGISTER'}
@@ -738,7 +738,7 @@ class ANIM_OT_check_dirty(Operator):
         obj = context.object
         settings = obj.cache_settings
         
-        current_hash = CacheDirtyTracker.compute_hash(obj)
+        current_hash = BB_CacheDirtyTracker.compute_hash(obj)
         
         if current_hash != settings.last_hash:
             settings.state = 'DIRTY'
@@ -749,9 +749,9 @@ class ANIM_OT_check_dirty(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_force_refresh(Operator):
+class BB_OT_force_refresh(Operator):
     """Force check for cache updates"""
-    bl_idname = "anim.force_refresh"
+    bl_idname = "bb.force_refresh"
     bl_label = "Refresh Cache Status"
     bl_description = "Manually check if cache needs updating"
     bl_options = {'REGISTER'}
@@ -765,7 +765,7 @@ class ANIM_OT_force_refresh(Operator):
         settings = obj.cache_settings
         
         if settings.state == 'READY':
-            current_hash = CacheDirtyTracker.compute_hash(obj)
+            current_hash = BB_CacheDirtyTracker.compute_hash(obj)
             if current_hash != settings.last_hash:
                 settings.state = 'DIRTY'
                 self.report({'WARNING'}, "Animation changed - cache is now dirty")
@@ -775,9 +775,9 @@ class ANIM_OT_force_refresh(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_bake_all(Operator):
+class BB_OT_bake_all(Operator):
     """Bake cache for all rigged meshes in scene"""
-    bl_idname = "anim.bake_all"
+    bl_idname = "bb.bake_all"
     bl_label = "Bake All"
     bl_description = "Bake cache for all rigged mesh objects"
     bl_options = {'REGISTER', 'UNDO'}
@@ -804,9 +804,9 @@ class ANIM_OT_bake_all(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_clear_all(Operator):
+class BB_OT_clear_all(Operator):
     """Clear all caches in scene"""
-    bl_idname = "anim.clear_all"
+    bl_idname = "bb.clear_all"
     bl_label = "Clear All"
     bl_description = "Clear cache for all cached objects"
     bl_options = {'REGISTER', 'UNDO'}
@@ -858,10 +858,10 @@ class ANIM_OT_clear_all(Operator):
 # UI PANEL
 # ============================================================================
 
-class ANIM_PT_cache_panel(Panel):
+class BB_PT_cache_panel(Panel):
     """Animation Cache panel in Object properties"""
     bl_label = "Animation Cache (MDD)"
-    bl_idname = "ANIM_PT_cache_panel"
+    bl_idname = "BB_PT_cache_panel"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "object"
@@ -922,7 +922,7 @@ class ANIM_PT_cache_panel(Panel):
         row = col.row(align=True)
         row.prop(settings, "frame_start")
         row.prop(settings, "frame_end")
-        row.operator("anim.sync_frame_range", text="", icon='TIME')
+        row.operator("bb.sync_frame_range", text="", icon='TIME')
         
         layout.separator()
         
@@ -932,11 +932,11 @@ class ANIM_PT_cache_panel(Panel):
         
         if settings.state == 'BAKING':
             # Show stop button instead of bake when actively baking
-            row.operator("anim.stop_cache", text="Stop", icon='CANCEL')
+            row.operator("bb.stop_cache", text="Stop", icon='CANCEL')
         else:
-            row.operator("anim.bake_cache", text="Bake Cache", icon='RENDER_ANIMATION')
+            row.operator("bb.bake_cache", text="Bake Cache", icon='RENDER_ANIMATION')
         
-        row.operator("anim.clear_cache", text="Clear", icon='TRASH')
+        row.operator("bb.clear_cache", text="Clear", icon='TRASH')
         
         # Playback toggle (only show if cache exists)
         if settings.state in ('READY', 'DIRTY'):
@@ -947,11 +947,11 @@ class ANIM_PT_cache_panel(Panel):
             row.scale_y = 1.5
             
             # Live Rig button
-            op = row.operator("anim.set_playback_mode", text="Live Rig", icon='ARMATURE_DATA', depress=not settings.use_cached_playback)
+            op = row.operator("bb.set_playback_mode", text="Live Rig", icon='ARMATURE_DATA', depress=not settings.use_cached_playback)
             op.mode = 'LIVE'
             
             # Cache button
-            op = row.operator("anim.set_playback_mode", text="Cache", icon='PLAY', depress=settings.use_cached_playback)
+            op = row.operator("bb.set_playback_mode", text="Cache", icon='PLAY', depress=settings.use_cached_playback)
             op.mode = 'CACHE'
             
             # Dirty warning
@@ -960,7 +960,7 @@ class ANIM_PT_cache_panel(Panel):
                 box = layout.box()
                 box.alert = True
                 box.label(text="Animation changed", icon='ERROR')
-                box.operator("anim.bake_cache", text="Rebake Now", icon='FILE_REFRESH')
+                box.operator("bb.bake_cache", text="Rebake Now", icon='FILE_REFRESH')
 
 
 class BB_PT_cache_npanel(Panel):
@@ -988,13 +988,13 @@ class BB_PT_cache_npanel(Panel):
         row = col.row(align=True)
         row.prop(scene_settings, "frame_start")
         row.prop(scene_settings, "frame_end")
-        row.operator("anim.sync_frame_range_global", text="", icon='TIME')
+        row.operator("bb.sync_frame_range_global", text="", icon='TIME')
         
         # Batch operations
         row = layout.row(align=True)
         row.scale_y = 1.2
-        row.operator("anim.bake_all", text="Bake All", icon='RENDER_ANIMATION')
-        row.operator("anim.clear_all", text="Clear All", icon='TRASH')
+        row.operator("bb.bake_all", text="Bake All", icon='RENDER_ANIMATION')
+        row.operator("bb.clear_all", text="Clear All", icon='TRASH')
         
         layout.separator()
         
@@ -1053,19 +1053,19 @@ class BB_PT_cache_npanel(Panel):
         # Buttons (icons only)
         if settings.state == 'BAKING':
             # Stop button while baking
-            op = row.operator("anim.stop_cache", text="", icon='PAUSE')
+            op = row.operator("bb.stop_cache", text="", icon='PAUSE')
             # Disable other buttons
             row.label(text="", icon='BLANK1')
             row.label(text="", icon='BLANK1')
             row.label(text="", icon='BLANK1')
         else:
             # Bake button
-            op = row.operator("anim.bake_cache_single", text="", icon='FILE_REFRESH')
+            op = row.operator("bb.bake_cache_single", text="", icon='FILE_REFRESH')
             op.object_name = obj.name
             
             # Clear button (only if cached)
             if settings.state in ('READY', 'DIRTY', 'ERROR'):
-                op = row.operator("anim.clear_cache_single", text="", icon='TRASH')
+                op = row.operator("bb.clear_cache_single", text="", icon='TRASH')
                 op.object_name = obj.name
             else:
                 row.label(text="", icon='BLANK1')
@@ -1073,13 +1073,13 @@ class BB_PT_cache_npanel(Panel):
             # Live Rig / Cache buttons (only if cached)
             if settings.state in ('READY', 'DIRTY'):
                 # Live Rig button
-                op = row.operator("anim.set_playback_mode_single", text="", icon='ARMATURE_DATA', 
+                op = row.operator("bb.set_playback_mode_single", text="", icon='ARMATURE_DATA', 
                                  depress=not settings.use_cached_playback)
                 op.object_name = obj.name
                 op.mode = 'LIVE'
                 
                 # Cache button  
-                op = row.operator("anim.set_playback_mode_single", text="", icon='PLAY',
+                op = row.operator("bb.set_playback_mode_single", text="", icon='PLAY',
                                  depress=settings.use_cached_playback)
                 op.object_name = obj.name
                 op.mode = 'CACHE'
@@ -1089,9 +1089,9 @@ class BB_PT_cache_npanel(Panel):
 
 
 # Single-object operators for N-panel
-class ANIM_OT_bake_cache_single(Operator):
+class BB_OT_bake_cache_single(Operator):
     """Bake cache for specific object"""
-    bl_idname = "anim.bake_cache_single"
+    bl_idname = "bb.bake_cache_single"
     bl_label = "Bake Cache"
     bl_options = {'REGISTER', 'UNDO'}
     
@@ -1111,9 +1111,9 @@ class ANIM_OT_bake_cache_single(Operator):
             return {'CANCELLED'}
 
 
-class ANIM_OT_clear_cache_single(Operator):
+class BB_OT_clear_cache_single(Operator):
     """Clear cache for specific object"""
-    bl_idname = "anim.clear_cache_single"
+    bl_idname = "bb.clear_cache_single"
     bl_label = "Clear Cache"
     bl_options = {'REGISTER', 'UNDO'}
     
@@ -1158,9 +1158,9 @@ class ANIM_OT_clear_cache_single(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_set_playback_mode_single(Operator):
+class BB_OT_set_playback_mode_single(Operator):
     """Set playback mode for specific object"""
-    bl_idname = "anim.set_playback_mode_single"
+    bl_idname = "bb.set_playback_mode_single"
     bl_label = "Set Playback Mode"
     bl_options = {'REGISTER', 'UNDO'}
     
@@ -1182,9 +1182,9 @@ class ANIM_OT_set_playback_mode_single(Operator):
         return {'FINISHED'}
 
 
-class ANIM_OT_sync_frame_range_global(Operator):
+class BB_OT_sync_frame_range_global(Operator):
     """Sync global frame range from timeline"""
-    bl_idname = "anim.sync_frame_range_global"
+    bl_idname = "bb.sync_frame_range_global"
     bl_label = "Sync Frame Range"
     bl_options = {'REGISTER', 'UNDO'}
     
@@ -1384,22 +1384,22 @@ def cleanup_orphaned_temp_files():
 # ============================================================================
 
 classes = (
-    AnimCacheSettings,
-    BBCacheSceneSettings,
-    ANIM_OT_bake_cache,
-    ANIM_OT_stop_cache,
-    ANIM_OT_clear_cache,
-    ANIM_OT_set_playback_mode,
-    ANIM_OT_sync_frame_range,
-    ANIM_OT_check_dirty,
-    ANIM_OT_force_refresh,
-    ANIM_OT_bake_all,
-    ANIM_OT_clear_all,
-    ANIM_OT_bake_cache_single,
-    ANIM_OT_clear_cache_single,
-    ANIM_OT_set_playback_mode_single,
-    ANIM_OT_sync_frame_range_global,
-    ANIM_PT_cache_panel,
+    BB_CacheSettings,
+    BB_CacheSceneSettings,
+    BB_OT_bake_cache,
+    BB_OT_stop_cache,
+    BB_OT_clear_cache,
+    BB_OT_set_playback_mode,
+    BB_OT_sync_frame_range,
+    BB_OT_check_dirty,
+    BB_OT_force_refresh,
+    BB_OT_bake_all,
+    BB_OT_clear_all,
+    BB_OT_bake_cache_single,
+    BB_OT_clear_cache_single,
+    BB_OT_set_playback_mode_single,
+    BB_OT_sync_frame_range_global,
+    BB_PT_cache_panel,
     BB_PT_cache_npanel,
 )
 
@@ -1410,8 +1410,8 @@ def register():
         bpy.utils.register_class(cls)
     
     # Add properties
-    bpy.types.Object.cache_settings = PointerProperty(type=AnimCacheSettings)
-    bpy.types.Scene.bb_cache_settings = PointerProperty(type=BBCacheSceneSettings)
+    bpy.types.Object.cache_settings = PointerProperty(type=BB_CacheSettings)
+    bpy.types.Scene.bb_cache_settings = PointerProperty(type=BB_CacheSceneSettings)
     
     # Clean up any leftover temp files from previous crashes/interruptions
     try:
