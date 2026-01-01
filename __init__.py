@@ -1,0 +1,1129 @@
+bl_info = {
+    "name": "Animation Cache (MDD)",
+    "author": "Your Name",
+    "version": (1, 0, 0),
+    "blender": (5, 0, 0),
+    "location": "Properties > Object > Animation Cache",
+    "description": "Maya-style background animation caching using MDD format",
+    "category": "Animation",
+}
+
+import bpy
+import struct
+import numpy as np
+from pathlib import Path
+import shutil
+import hashlib
+import json
+from bpy.props import (
+    BoolProperty,
+    StringProperty,
+    IntProperty,
+    FloatProperty,
+    EnumProperty,
+    PointerProperty,
+)
+from bpy.types import (
+    Operator,
+    Panel,
+    PropertyGroup,
+    AddonPreferences,
+)
+
+
+# ============================================================================
+# CACHE MANAGER - Core caching logic
+# ============================================================================
+
+class MDDCacheManager:
+    """Handles MDD file writing and frame caching"""
+    
+    def __init__(self, obj, cache_dir, frame_start, frame_end):
+        self.obj = obj
+        self.cache_dir = Path(cache_dir)
+        self.frame_start = frame_start
+        self.frame_end = frame_end
+        self.temp_dir = self.cache_dir / ".temp" / obj.name
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Track what's been baked
+        self.cached_frames = set()
+        self.num_verts = len(obj.data.vertices)
+    
+    def bake_frame(self, frame):
+        """Bake a single frame to temporary storage"""
+        try:
+            scene = bpy.context.scene
+            scene.frame_set(frame)
+            
+            # Get evaluated mesh
+            dg = bpy.context.evaluated_depsgraph_get()
+            obj_eval = self.obj.evaluated_get(dg)
+            mesh = obj_eval.to_mesh()
+            
+            # Verify topology hasn't changed
+            if len(mesh.vertices) != self.num_verts:
+                obj_eval.to_mesh_clear()
+                return False, f"Vertex count changed at frame {frame}"
+            
+            # Extract positions efficiently using foreach_get
+            positions = np.zeros((len(mesh.vertices), 3), dtype=np.float32)
+            mesh.vertices.foreach_get('co', positions.ravel())
+            
+            # Save to temp file
+            temp_file = self.temp_dir / f"frame_{frame:04d}.npy"
+            np.save(temp_file, positions)
+            
+            # Cleanup
+            obj_eval.to_mesh_clear()
+            
+            self.cached_frames.add(frame)
+            return True, None
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def stitch_mdd(self):
+        """Combine all temp frames into final MDD file"""
+        try:
+            frames = sorted(self.cached_frames)
+            if not frames:
+                return False, "No frames to stitch"
+            
+            num_frames = len(frames)
+            fps = bpy.context.scene.render.fps
+            
+            # Output path
+            mdd_path = self.cache_dir / f"{self.obj.name}.mdd"
+            
+            with open(mdd_path, "wb") as f:
+                # Write header (big-endian)
+                f.write(struct.pack(">2i", num_frames, self.num_verts))
+                
+                # Write timecodes
+                for i, frame in enumerate(frames):
+                    timecode = frame / fps
+                    f.write(struct.pack(">f", timecode))
+                
+                # Write all frame data
+                for frame in frames:
+                    frame_file = self.temp_dir / f"frame_{frame:04d}.npy"
+                    positions = np.load(frame_file)
+                    # MDD uses big-endian floats
+                    positions.astype('>f4').tofile(f)
+            
+            # Save metadata
+            meta = {
+                "object": self.obj.name,
+                "frames": list(frames),
+                "num_verts": self.num_verts,
+                "fps": fps,
+            }
+            meta_path = self.cache_dir / f"{self.obj.name}.json"
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+            
+            return True, str(mdd_path)
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def cleanup_temp(self):
+        """Remove temporary frame files"""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir)
+    
+    def get_progress(self):
+        """Return baking progress (0.0 to 1.0)"""
+        total = self.frame_end - self.frame_start + 1
+        return len(self.cached_frames) / total if total > 0 else 0.0
+
+
+# ============================================================================
+# DIRTY DETECTION - Track when cache needs rebuilding
+# ============================================================================
+
+class CacheDirtyTracker:
+    """Detect when animation data changes"""
+    
+    @staticmethod
+    def compute_hash(obj):
+        """Generate hash of animation-relevant data"""
+        data_parts = []
+        
+        # DON'T hash current transforms/matrices - they change during baking!
+        # DON'T hash modifier visibility - that changes when toggling cache on/off!
+        # Only hash the animation DATA (keyframes, actions, etc)
+        
+        # Hash armature's action if present
+        if obj.parent and obj.parent.type == 'ARMATURE':
+            armature = obj.parent
+            
+            # Hash armature's action
+            if armature.animation_data and armature.animation_data.action:
+                action = armature.animation_data.action
+                data_parts.append(f"action:{action.name}:{action.id_data.name}")
+                
+                # Hash all fcurves - this catches keyframe changes
+                if hasattr(action, 'fcurves') and action.fcurves:
+                    for fcurve in action.fcurves:
+                        data_parts.append(f"{fcurve.data_path}:{fcurve.array_index}")
+                        # Hash keyframe count and values
+                        if hasattr(fcurve, 'keyframe_points'):
+                            data_parts.append(f"kf_count:{len(fcurve.keyframe_points)}")
+                            # Hash first and last keyframe positions
+                            if len(fcurve.keyframe_points) > 0:
+                                first = fcurve.keyframe_points[0]
+                                last = fcurve.keyframe_points[-1]
+                                data_parts.append(f"first:{first.co[0]},{first.co[1]}")
+                                data_parts.append(f"last:{last.co[0]},{last.co[1]}")
+        
+        # Hash which modifiers exist and their type (but NOT visibility)
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                mod_obj = "None" if mod.object is None else mod.object.name
+                data_parts.append(f"mod:{mod.name}:ARMATURE:{mod_obj}")
+            elif mod.type != 'MESH_CACHE':  # Ignore cache modifier itself
+                data_parts.append(f"mod:{mod.name}:{mod.type}")
+        
+        # Hash object's own keyframe data
+        if obj.animation_data and obj.animation_data.action:
+            action = obj.animation_data.action
+            data_parts.append(f"obj_action:{action.name}")
+            if hasattr(action, 'fcurves') and action.fcurves:
+                for fcurve in action.fcurves:
+                    data_parts.append(f"{fcurve.data_path}:{len(fcurve.keyframe_points)}")
+        
+        # Hash shape keys if present
+        if obj.data.shape_keys:
+            for key in obj.data.shape_keys.key_blocks:
+                # Only hash the key setup, not current values
+                data_parts.append(f"shapekey:{key.name}")
+        
+        # Create hash
+        combined = "".join(data_parts)
+        return hashlib.md5(combined.encode()).hexdigest()
+
+
+# ============================================================================
+# BACKGROUND WORKER - Handles idle-time baking
+# ============================================================================
+
+class BackgroundCacheWorker:
+    """Global worker that bakes frames in the background"""
+    
+    def __init__(self):
+        self.active_jobs = {}  # obj_name -> manager
+        self.bake_queue = []  # [(obj_name, frame), ...]
+        self.is_registered = False
+    
+    def start_cache_job(self, obj):
+        """Start a new caching job for an object"""
+        
+        # Prevent starting duplicate jobs
+        if obj.name in self.active_jobs:
+            print(f"[Cache] Job already running for {obj.name}, skipping")
+            return
+        
+        # Also check if already in queue
+        if any(o == obj.name for o, f in self.bake_queue):
+            print(f"[Cache] {obj.name} already in queue, skipping")
+            return
+        
+        scene = bpy.context.scene
+        
+        # Get cache settings
+        cache_settings = obj.cache_settings
+        cache_dir = Path(bpy.path.abspath(cache_settings.cache_path))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create manager
+        manager = MDDCacheManager(
+            obj,
+            cache_dir,
+            cache_settings.frame_start,
+            cache_settings.frame_end
+        )
+        
+        # Add to active jobs
+        self.active_jobs[obj.name] = manager
+        
+        # Build frame queue
+        frames = range(cache_settings.frame_start, cache_settings.frame_end + 1)
+        for frame in frames:
+            self.bake_queue.append((obj.name, frame))
+        
+        # Update state
+        cache_settings.state = 'BAKING'
+        cache_settings.progress = 0.0
+        
+        print(f"[Cache] Started job for {obj.name} ({len(frames)} frames)")
+        
+        # Register timer if not already
+        if not self.is_registered:
+            bpy.app.timers.register(self.idle_worker, persistent=True)
+            self.is_registered = True
+    
+    def idle_worker(self):
+        """Timer callback - bakes one frame at a time"""
+        
+        global _auto_reenable_cache
+        
+        if not self.bake_queue:
+            # No work to do - unregister and stop
+            if self.is_registered:
+                print("[Cache] All jobs complete")
+                self.is_registered = False
+                return None  # Unregister timer
+            return 0.5
+        
+        # Bake next frame
+        obj_name, frame = self.bake_queue.pop(0)
+        
+        # Check if object still exists
+        if obj_name not in bpy.data.objects:
+            # Clean up job
+            if obj_name in self.active_jobs:
+                del self.active_jobs[obj_name]
+            return 0.01
+        
+        obj = bpy.data.objects[obj_name]
+        manager = self.active_jobs[obj_name]
+        
+        # Bake the frame
+        success, error = manager.bake_frame(frame)
+        
+        if not success:
+            # Error occurred
+            obj.cache_settings.state = 'ERROR'
+            obj.cache_settings.error_message = error
+            del self.active_jobs[obj_name]
+            # Remove remaining frames for this object
+            self.bake_queue = [(o, f) for o, f in self.bake_queue if o != obj_name]
+            return 0.01
+        
+        # Update progress
+        obj.cache_settings.progress = manager.get_progress()
+        
+        # Check if this object's queue is complete
+        remaining = [o for o, f in self.bake_queue if o == obj_name]
+        if not remaining:
+            # Stitch the MDD file
+            success, result = manager.stitch_mdd()
+            
+            if success:
+                # Apply mesh cache modifier
+                apply_mesh_cache_modifier(obj, result)
+                obj.cache_settings.state = 'READY'
+                obj.cache_settings.cache_file_path = result
+                
+                # Check if this was an auto-rebuild that needs cache re-enabled
+                print(f"[Cache] Checking auto-reenable for '{obj.name}': {obj.name in _auto_reenable_cache}")
+                print(f"[Cache] _auto_reenable_cache contents: {_auto_reenable_cache}")
+                
+                if obj.name in _auto_reenable_cache:
+                    obj.cache_settings.use_cached_playback = True
+                    print(f"[Cache] Re-enabled cached playback for {obj.name} after auto-rebuild")
+                    _auto_reenable_cache.discard(obj.name)
+                else:
+                    # AUTO-ENABLE cached playback after manual baking
+                    obj.cache_settings.use_cached_playback = True
+                    print(f"[Cache] Auto-enabled cached playback for {obj.name}")
+                
+                manager.cleanup_temp()
+            else:
+                obj.cache_settings.state = 'ERROR'
+                obj.cache_settings.error_message = result
+            
+            del self.active_jobs[obj_name]
+        
+        # Continue quickly to next frame
+        return 0.01
+
+
+# Global worker instance
+g_worker = BackgroundCacheWorker()
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def apply_mesh_cache_modifier(obj, cache_path):
+    """Add or update mesh cache modifier"""
+    # Find existing cache modifier
+    cache_mod = None
+    for mod in obj.modifiers:
+        if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+            cache_mod = mod
+            break
+    
+    # Create new if doesn't exist
+    if not cache_mod:
+        cache_mod = obj.modifiers.new("AnimCache_MDD", "MESH_CACHE")
+    
+    # Configure modifier
+    cache_mod.cache_format = 'MDD'
+    cache_mod.filepath = cache_path
+    cache_mod.frame_start = obj.cache_settings.frame_start
+    cache_mod.forward_axis = 'POS_Y'
+    cache_mod.up_axis = 'POS_Z'
+    # Don't set flip_axis - leave it as default empty set
+    
+    # Disable armature modifier during cached playback
+    if obj.cache_settings.use_cached_playback:
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                mod.show_viewport = False
+        cache_mod.show_viewport = True
+    else:
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                mod.show_viewport = True
+        cache_mod.show_viewport = False
+
+
+def get_default_cache_path():
+    """Get default cache directory path"""
+    if bpy.data.filepath:
+        blend_dir = Path(bpy.data.filepath).parent
+        return str(blend_dir / "cache")
+    else:
+        return "//cache"
+
+
+# ============================================================================
+# PROPERTY GROUP - Settings stored per object
+# ============================================================================
+
+class AnimCacheSettings(PropertyGroup):
+    """Per-object cache settings"""
+    
+    cache_path: StringProperty(
+        name="Cache Directory",
+        description="Where to store cache files",
+        default="",
+        subtype='DIR_PATH'
+    )
+    
+    frame_start: IntProperty(
+        name="Start Frame",
+        description="First frame to cache",
+        default=1
+    )
+    
+    frame_end: IntProperty(
+        name="End Frame", 
+        description="Last frame to cache",
+        default=250
+    )
+    
+    state: EnumProperty(
+        name="Cache State",
+        items=[
+            ('NONE', "None", "No cache"),
+            ('DIRTY', "Dirty", "Cache needs rebuilding"),
+            ('BAKING', "Baking", "Currently baking cache"),
+            ('READY', "Ready", "Cache ready for playback"),
+            ('ERROR', "Error", "Cache error occurred"),
+        ],
+        default='NONE'
+    )
+    
+    progress: FloatProperty(
+        name="Progress",
+        description="Baking progress",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype='PERCENTAGE'
+    )
+    
+    use_cached_playback: BoolProperty(
+        name="Use Cached Playback",
+        description="Play from cache instead of evaluating rig",
+        default=True,
+        update=lambda self, context: toggle_cached_playback(self, context)
+    )
+    
+    cache_file_path: StringProperty(
+        name="Cache File",
+        description="Path to generated MDD file",
+        default=""
+    )
+    
+    error_message: StringProperty(
+        name="Error Message",
+        description="Last error message",
+        default=""
+    )
+    
+    last_hash: StringProperty(
+        name="Last Hash",
+        description="Hash of last cached state",
+        default=""
+    )
+
+
+def toggle_cached_playback(settings, context):
+    """Toggle between cached and live playback"""
+    # Find which object these settings belong to
+    obj = None
+    for o in bpy.data.objects:
+        if hasattr(o, 'cache_settings') and o.cache_settings == settings:
+            obj = o
+            break
+    
+    if obj is None:
+        print("[Cache] WARNING: Could not find object for settings")
+        return
+    
+    print(f"[Cache] Toggling cache for '{obj.name}' to {'ON' if settings.use_cached_playback else 'OFF'}")
+    
+    # Update modifier visibility
+    for mod in obj.modifiers:
+        if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+            mod.show_viewport = settings.use_cached_playback
+            print(f"[Cache]   Mesh Cache modifier: {mod.show_viewport}")
+        elif mod.type == 'ARMATURE':
+            mod.show_viewport = not settings.use_cached_playback
+            print(f"[Cache]   Armature modifier: {mod.show_viewport}")
+    
+    # Force viewport update
+    if context and hasattr(context, 'screen'):
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+# ============================================================================
+# OPERATORS
+# ============================================================================
+
+class ANIM_OT_bake_cache(Operator):
+    """Manually start baking cache"""
+    bl_idname = "anim.bake_cache"
+    bl_label = "Bake Cache"
+    bl_description = "Start baking animation cache for this object"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None and 
+                context.object.type == 'MESH')
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        # Set defaults if needed
+        if not settings.cache_path:
+            settings.cache_path = get_default_cache_path()
+        
+        scene = context.scene
+        if settings.frame_start == 0:
+            settings.frame_start = scene.frame_start
+        if settings.frame_end == 0:
+            settings.frame_end = scene.frame_end
+        
+        # Compute hash
+        settings.last_hash = CacheDirtyTracker.compute_hash(obj)
+        
+        # Start job
+        g_worker.start_cache_job(obj)
+        
+        self.report({'INFO'}, f"Started baking cache for {obj.name}")
+        return {'FINISHED'}
+
+
+class ANIM_OT_clear_cache(Operator):
+    """Clear cache for this object"""
+    bl_idname = "anim.clear_cache"
+    bl_label = "Clear Cache"
+    bl_description = "Remove cached files and reset state"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None and 
+                context.object.type == 'MESH')
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        # Remove from active jobs
+        if obj.name in g_worker.active_jobs:
+            manager = g_worker.active_jobs[obj.name]
+            manager.cleanup_temp()
+            del g_worker.active_jobs[obj.name]
+        
+        # Remove from queue
+        g_worker.bake_queue = [(o, f) for o, f in g_worker.bake_queue if o != obj.name]
+        
+        # Delete cache files
+        if settings.cache_file_path:
+            cache_path = Path(settings.cache_file_path)
+            if cache_path.exists():
+                cache_path.unlink()
+            
+            # Delete metadata
+            meta_path = cache_path.with_suffix('.json')
+            if meta_path.exists():
+                meta_path.unlink()
+        
+        # Remove modifier
+        for mod in obj.modifiers:
+            if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+                obj.modifiers.remove(mod)
+        
+        # Re-enable armature
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                mod.show_viewport = True
+        
+        # Reset state
+        settings.state = 'NONE'
+        settings.progress = 0.0
+        settings.cache_file_path = ""
+        settings.error_message = ""
+        
+        self.report({'INFO'}, f"Cleared cache for {obj.name}")
+        return {'FINISHED'}
+
+
+class ANIM_OT_stop_cache(Operator):
+    """Stop currently running cache operation"""
+    bl_idname = "anim.stop_cache"
+    bl_label = "Stop Caching"
+    bl_description = "Cancel the current cache baking operation"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and 
+                obj.type == 'MESH' and
+                obj.cache_settings.state == 'BAKING')
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        # Remove from active jobs
+        if obj.name in g_worker.active_jobs:
+            manager = g_worker.active_jobs[obj.name]
+            manager.cleanup_temp()
+            del g_worker.active_jobs[obj.name]
+        
+        # Remove from queue
+        g_worker.bake_queue = [(o, f) for o, f in g_worker.bake_queue if o != obj.name]
+        
+        # Reset state
+        settings.state = 'NONE'
+        settings.progress = 0.0
+        
+        self.report({'INFO'}, f"Stopped caching for {obj.name}")
+        return {'FINISHED'}
+
+
+class ANIM_OT_set_playback_mode(Operator):
+    """Set playback mode (Live Rig or Cache)"""
+    bl_idname = "anim.set_playback_mode"
+    bl_label = "Set Playback Mode"
+    bl_description = "Switch between live rig and cached playback"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    mode: bpy.props.EnumProperty(
+        items=[
+            ('LIVE', "Live Rig", "Use live rig evaluation"),
+            ('CACHE', "Cache", "Use cached playback"),
+        ]
+    )
+    
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and 
+                obj.type == 'MESH' and
+                obj.cache_settings.state in ('READY', 'DIRTY'))
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        if self.mode == 'CACHE':
+            settings.use_cached_playback = True
+            self.report({'INFO'}, "Switched to cached playback")
+        else:
+            settings.use_cached_playback = False
+            self.report({'INFO'}, "Switched to live rig")
+        
+        return {'FINISHED'}
+
+
+class ANIM_OT_sync_frame_range(Operator):
+    """Sync frame range from timeline"""
+    bl_idname = "anim.sync_frame_range"
+    bl_label = "Sync Frame Range"
+    bl_description = "Set cache frame range to match timeline"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return (context.object is not None and 
+                context.object.type == 'MESH')
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        scene = context.scene
+        
+        settings.frame_start = scene.frame_start
+        settings.frame_end = scene.frame_end
+        
+        self.report({'INFO'}, f"Synced to timeline: {scene.frame_start}-{scene.frame_end}")
+        return {'FINISHED'}
+
+
+class ANIM_OT_check_dirty(Operator):
+    """Check if cache is dirty"""
+    bl_idname = "anim.check_dirty"
+    bl_label = "Check Dirty"
+    bl_description = "Check if animation has changed since last cache"
+    bl_options = {'REGISTER'}
+    
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and 
+                obj.type == 'MESH' and
+                obj.cache_settings.state == 'READY')
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        current_hash = CacheDirtyTracker.compute_hash(obj)
+        
+        if current_hash != settings.last_hash:
+            settings.state = 'DIRTY'
+            self.report({'WARNING'}, "Cache is dirty - animation has changed")
+        else:
+            self.report({'INFO'}, "Cache is up to date")
+        
+        return {'FINISHED'}
+
+
+class ANIM_OT_force_refresh(Operator):
+    """Force check for cache updates"""
+    bl_idname = "anim.force_refresh"
+    bl_label = "Refresh Cache Status"
+    bl_description = "Manually check if cache needs updating"
+    bl_options = {'REGISTER'}
+    
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+    
+    def execute(self, context):
+        obj = context.object
+        settings = obj.cache_settings
+        
+        if settings.state == 'READY':
+            current_hash = CacheDirtyTracker.compute_hash(obj)
+            if current_hash != settings.last_hash:
+                settings.state = 'DIRTY'
+                self.report({'WARNING'}, "Animation changed - cache is now dirty")
+            else:
+                self.report({'INFO'}, "Cache is up to date")
+        
+        return {'FINISHED'}
+
+
+# ============================================================================
+# UI PANEL
+# ============================================================================
+
+class ANIM_PT_cache_panel(Panel):
+    """Animation Cache panel in Object properties"""
+    bl_label = "Animation Cache (MDD)"
+    bl_idname = "ANIM_PT_cache_panel"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "object"
+    
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        settings = obj.cache_settings
+        
+        # Force UI refresh during baking
+        if settings.state == 'BAKING':
+            # Tag for redraw to update progress bar
+            for area in context.screen.areas:
+                if area.type == 'PROPERTIES':
+                    area.tag_redraw()
+        
+        # Status indicator
+        row = layout.row()
+        if settings.state == 'NONE':
+            row.label(text="○ Not Cached", icon='RADIOBUT_OFF')
+        elif settings.state == 'DIRTY':
+            row.label(text="● Dirty", icon='ERROR')
+        elif settings.state == 'BAKING':
+            row.label(text="● Baking", icon='TIME')
+        elif settings.state == 'READY':
+            row.label(text="● Ready", icon='CHECKMARK')
+        elif settings.state == 'ERROR':
+            row.label(text="● Error", icon='CANCEL')
+        
+        # Progress bar during baking
+        if settings.state == 'BAKING':
+            col = layout.column()
+            col.prop(settings, "progress", text="Progress", slider=True)
+            
+            # Calculate frames done
+            total_frames = settings.frame_end - settings.frame_start + 1
+            frames_done = int(settings.progress * total_frames)
+            col.label(text=f"{frames_done} / {total_frames} frames")
+        
+        # Error message
+        if settings.state == 'ERROR' and settings.error_message:
+            box = layout.box()
+            col = box.column()
+            col.alert = True
+            col.label(text="Error:", icon='ERROR')
+            col.label(text=settings.error_message)
+        
+        layout.separator()
+        
+        # Settings
+        col = layout.column()
+        col.prop(settings, "cache_path")
+        
+        row = col.row(align=True)
+        row.prop(settings, "frame_start")
+        row.prop(settings, "frame_end")
+        row.operator("anim.sync_frame_range", text="", icon='TIME')
+        
+        layout.separator()
+        
+        # Actions
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        
+        if settings.state == 'BAKING':
+            # Show stop button instead of bake when actively baking
+            row.operator("anim.stop_cache", text="Stop", icon='CANCEL')
+        else:
+            row.operator("anim.bake_cache", text="Bake Cache", icon='RENDER_ANIMATION')
+        
+        row.operator("anim.clear_cache", text="Clear", icon='TRASH')
+        
+        # Playback toggle (only show if cache exists)
+        if settings.state in ('READY', 'DIRTY'):
+            layout.separator()
+            
+            # Two buttons side-by-side
+            row = layout.row(align=True)
+            row.scale_y = 1.5
+            
+            # Live Rig button
+            op = row.operator("anim.set_playback_mode", text="Live Rig", icon='ARMATURE_DATA', depress=not settings.use_cached_playback)
+            op.mode = 'LIVE'
+            
+            # Cache button
+            op = row.operator("anim.set_playback_mode", text="Cache", icon='PLAY', depress=settings.use_cached_playback)
+            op.mode = 'CACHE'
+            
+            # Dirty warning
+            if settings.state == 'DIRTY':
+                layout.separator()
+                box = layout.box()
+                box.alert = True
+                box.label(text="Animation changed", icon='ERROR')
+                box.operator("anim.bake_cache", text="Rebake Now", icon='FILE_REFRESH')
+
+
+# ============================================================================
+# MODE CHANGE HANDLER - Auto-disable cache when editing
+# ============================================================================
+
+# Track previous mode states and cache states
+_previous_modes = {}
+_was_cache_enabled = {}  # Track which objects had cache enabled before pose mode
+_mode_check_running = False  # Lock to prevent concurrent execution
+_auto_reenable_cache = set()  # Track which objects should have cache re-enabled after rebuild
+_last_mode_change_time = {}  # Track last time each armature changed mode (for debouncing)
+_msgbus_owner = object()
+
+def check_mode_changes():
+    """Check all armatures for mode changes"""
+    global _previous_modes, _was_cache_enabled, _mode_check_running, _auto_reenable_cache, _last_mode_change_time
+    
+    # Prevent concurrent execution
+    if _mode_check_running:
+        return
+    
+    _mode_check_running = True
+    
+    try:
+        import time
+        current_time = time.time()
+        
+        # Check all armatures for mode changes
+        for obj in bpy.data.objects:
+            if obj.type != 'ARMATURE':
+                continue
+            
+            # Get current mode
+            current_mode = obj.mode
+            previous_mode = _previous_modes.get(obj.name, 'OBJECT')
+            
+            # Debounce - ignore if changed less than 0.5 seconds ago
+            last_change = _last_mode_change_time.get(obj.name, 0)
+            if current_time - last_change < 0.5:
+                continue
+            
+            # Detect entering POSE mode
+            if current_mode == 'POSE' and previous_mode != 'POSE':
+                _last_mode_change_time[obj.name] = current_time
+                print(f"[Cache] Armature '{obj.name}' entered POSE mode - disabling caches")
+                
+                # Disable cache on all rigged meshes
+                for child in bpy.data.objects:
+                    if child.type != 'MESH':
+                        continue
+                    
+                    # Check if rigged to this armature
+                    is_rigged = False
+                    
+                    # Check parent
+                    if child.parent == obj:
+                        is_rigged = True
+                    
+                    # Check armature modifier
+                    if not is_rigged:
+                        for mod in child.modifiers:
+                            if mod.type == 'ARMATURE' and mod.object == obj:
+                                is_rigged = True
+                                break
+                    
+                    if is_rigged:
+                        child_settings = child.cache_settings
+                        
+                        # Only process if cache exists
+                        if child_settings.state in ('READY', 'DIRTY'):
+                            # Remember if cache was enabled
+                            was_enabled = child_settings.use_cached_playback
+                            print(f"[Cache] Cache state: {child_settings.state}, use_cached_playback: {was_enabled}")
+                            
+                            if was_enabled:
+                                _was_cache_enabled[child.name] = True
+                                print(f"[Cache] Storing: cache WAS enabled for '{child.name}'")
+                                print(f"[Cache] Disabling cache on '{child.name}'")
+                                
+                                # Directly disable modifiers
+                                for mod in child.modifiers:
+                                    if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+                                        mod.show_viewport = False
+                                        print(f"[Cache]   Mesh Cache modifier disabled")
+                                    elif mod.type == 'ARMATURE':
+                                        mod.show_viewport = True
+                                        print(f"[Cache]   Armature modifier enabled")
+                                
+                                # Update the property (this will keep UI in sync)
+                                child_settings.use_cached_playback = False
+                                
+                                # Force viewport refresh
+                                for window in bpy.context.window_manager.windows:
+                                    for area in window.screen.areas:
+                                        if area.type == 'VIEW_3D':
+                                            area.tag_redraw()
+                            else:
+                                print(f"[Cache] Cache already disabled for '{child.name}', not storing flag")
+            
+            # Detect exiting POSE mode
+            elif previous_mode == 'POSE' and current_mode != 'POSE':
+                _last_mode_change_time[obj.name] = current_time
+                print(f"[Cache] Armature '{obj.name}' exited POSE mode")
+                print(f"[Cache] Tracked cache states: {_was_cache_enabled}")
+                
+                # Check all rigged meshes
+                for child in bpy.data.objects:
+                    if child.type != 'MESH':
+                        continue
+                    
+                    # Check if rigged to this armature
+                    is_rigged = False
+                    
+                    if child.parent == obj:
+                        is_rigged = True
+                    
+                    if not is_rigged:
+                        for mod in child.modifiers:
+                            if mod.type == 'ARMATURE' and mod.object == obj:
+                                is_rigged = True
+                                break
+                    
+                    if is_rigged:
+                        child_settings = child.cache_settings
+                        
+                        # Check if cache exists (READY or DIRTY)
+                        if child_settings.state in ('READY', 'DIRTY'):
+                            print(f"[Cache] Marking '{child.name}' as DIRTY")
+                            child_settings.state = 'DIRTY'
+                            
+                            # Auto-rebake if cache was enabled before pose mode
+                            if _was_cache_enabled.get(child.name, False):
+                                print(f"[Cache] Auto-rebuilding '{child.name}' (cache was enabled)")
+                                # Mark for re-enabling after rebuild
+                                _auto_reenable_cache.add(child.name)
+                                print(f"[Cache] Added '{child.name}' to auto-reenable set: {_auto_reenable_cache}")
+                                g_worker.start_cache_job(child)
+                                # Clear the flag
+                                _was_cache_enabled.pop(child.name, None)
+                            else:
+                                print(f"[Cache] Not auto-rebuilding '{child.name}' (cache was disabled)")
+            
+            # Update tracked mode
+            _previous_modes[obj.name] = current_mode
+    
+    finally:
+        _mode_check_running = False
+
+@bpy.app.handlers.persistent
+def dummy_handler(scene):
+    """Dummy handler - not used, but kept for compatibility"""
+    pass
+
+
+def setup_msgbus_subscriptions():
+    """Subscribe to object mode changes via msgbus"""
+    subscribe_to = bpy.types.Object, "mode"
+    
+    bpy.msgbus.subscribe_rna(
+        key=subscribe_to,
+        owner=_msgbus_owner,
+        args=tuple(),
+        notify=check_mode_changes,
+    )
+    print("[Cache] Subscribed to mode changes via msgbus")
+
+
+# ============================================================================
+# DEPSGRAPH HANDLER - Dirty detection
+# ============================================================================
+
+def depsgraph_update_handler(scene, depsgraph):
+    """Detect when cached objects become dirty"""
+    
+    global _disable_dirty_detection
+    
+    # CRITICAL: Don't run during baking to prevent infinite loops
+    if _disable_dirty_detection:
+        return
+    
+    for update in depsgraph.updates:
+        # Check for object updates
+        if isinstance(update.id, bpy.types.Object):
+            obj = update.id
+            
+            # Only check mesh objects with ready caches (NOT baking!)
+            if obj.type != 'MESH':
+                continue
+            
+            settings = obj.cache_settings
+            
+            # CRITICAL: Don't check while baking - causes infinite loop!
+            if settings.state != 'READY':
+                continue
+            
+            # Check if animation data changed
+            current_hash = CacheDirtyTracker.compute_hash(obj)
+            if current_hash != settings.last_hash:
+                settings.state = 'DIRTY'
+                
+                # If background caching enabled, auto-rebake
+                if settings.enabled:
+                    settings.last_hash = current_hash
+                    g_worker.start_cache_job(obj)
+        
+        # Check for armature/action updates
+        elif isinstance(update.id, bpy.types.Action):
+            # An action was modified - mark all objects using it as dirty
+            for obj in bpy.data.objects:
+                if obj.type != 'MESH':
+                    continue
+                
+                settings = obj.cache_settings
+                
+                # CRITICAL: Only check READY state (not baking!)
+                if settings.state != 'READY':
+                    continue
+                
+                # Check if this object's armature uses this action
+                if obj.parent and obj.parent.type == 'ARMATURE':
+                    if obj.parent.animation_data and obj.parent.animation_data.action == update.id:
+                        current_hash = CacheDirtyTracker.compute_hash(obj)
+                        if current_hash != settings.last_hash:
+                            settings.state = 'DIRTY'
+                            
+                            if settings.enabled:
+                                settings.last_hash = current_hash
+                                g_worker.start_cache_job(obj)
+
+
+# ============================================================================
+# REGISTRATION
+# ============================================================================
+
+classes = (
+    AnimCacheSettings,
+    ANIM_OT_bake_cache,
+    ANIM_OT_stop_cache,
+    ANIM_OT_clear_cache,
+    ANIM_OT_set_playback_mode,
+    ANIM_OT_sync_frame_range,
+    ANIM_OT_check_dirty,
+    ANIM_OT_force_refresh,
+    ANIM_PT_cache_panel,
+)
+
+
+def register():
+    # Register classes
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    
+    # Add property to objects
+    bpy.types.Object.cache_settings = PointerProperty(type=AnimCacheSettings)
+    
+    # Subscribe to mode changes via msgbus ONLY (immediate detection)
+    setup_msgbus_subscriptions()
+
+
+def unregister():
+    # Unsubscribe from msgbus
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
+    
+    # Unregister timer if active
+    if g_worker.is_registered:
+        if bpy.app.timers.is_registered(g_worker.idle_worker):
+            bpy.app.timers.unregister(g_worker.idle_worker)
+    
+    # Remove property from objects
+    del bpy.types.Object.cache_settings
+    
+    # Unregister classes
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()
