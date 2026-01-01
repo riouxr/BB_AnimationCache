@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Animation Cache (MDD)",
-    "author": "Your Name",
-    "version": (1, 0, 0),
+    "name": "BB Cache Animation",
+    "author": "Blender Bob and Claude.ai",
+    "version": (2, 0, 0),
     "blender": (5, 0, 0),
-    "location": "Properties > Object > Animation Cache",
-    "description": "Maya-style background animation caching using MDD format",
+    "location": "View3D > N-Panel > Animation > BB Cache Animation",
+    "description": "Maya-style animation caching for multiple characters",
     "category": "Animation",
 }
 
@@ -49,12 +49,21 @@ class MDDCacheManager:
         # Track what's been baked
         self.cached_frames = set()
         self.num_verts = len(obj.data.vertices)
+        
+        # Store original frame to restore later
+        self.original_frame = bpy.context.scene.frame_current
     
     def bake_frame(self, frame):
         """Bake a single frame to temporary storage"""
         try:
             scene = bpy.context.scene
-            scene.frame_set(frame)
+            
+            # Set frame silently
+            scene.frame_current = frame
+            
+            # Force evaluation without viewport update
+            view_layer = bpy.context.view_layer
+            view_layer.update()
             
             # Get evaluated mesh
             dg = bpy.context.evaluated_depsgraph_get()
@@ -337,8 +346,8 @@ class BackgroundCacheWorker:
             
             del self.active_jobs[obj_name]
         
-        # Continue quickly to next frame
-        return 0.01
+        # Continue quickly to next frame (very fast to minimize viewport flicker)
+        return 0.001
 
 
 # Global worker instance
@@ -462,6 +471,29 @@ class AnimCacheSettings(PropertyGroup):
         name="Last Hash",
         description="Hash of last cached state",
         default=""
+    )
+
+
+class BBCacheSceneSettings(PropertyGroup):
+    """Scene-level cache settings"""
+    
+    cache_directory: StringProperty(
+        name="Cache Directory",
+        description="Global cache directory for all characters",
+        default="//cache",
+        subtype='DIR_PATH'
+    )
+    
+    frame_start: IntProperty(
+        name="Start",
+        description="Start frame for caching",
+        default=1
+    )
+    
+    frame_end: IntProperty(
+        name="End",
+        description="End frame for caching",
+        default=250
     )
 
 
@@ -741,6 +773,91 @@ class ANIM_OT_force_refresh(Operator):
         return {'FINISHED'}
 
 
+class ANIM_OT_bake_all(Operator):
+    """Bake cache for all rigged meshes in scene"""
+    bl_idname = "anim.bake_all"
+    bl_label = "Bake All"
+    bl_description = "Bake cache for all rigged mesh objects"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene_settings = context.scene.bb_cache_settings
+        baked_count = 0
+        
+        # Find all mesh objects with armature modifiers
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH':
+                continue
+            
+            # Check if it has an armature modifier
+            has_armature = any(mod.type == 'ARMATURE' for mod in obj.modifiers)
+            if not has_armature:
+                continue
+            
+            # Set frame range from scene settings
+            settings = obj.cache_settings
+            settings.cache_path = scene_settings.cache_directory
+            settings.frame_start = scene_settings.frame_start
+            settings.frame_end = scene_settings.frame_end
+            
+            # Start baking
+            g_worker.start_cache_job(obj)
+            baked_count += 1
+        
+        self.report({'INFO'}, f"Started baking {baked_count} objects")
+        return {'FINISHED'}
+
+
+class ANIM_OT_clear_all(Operator):
+    """Clear all caches in scene"""
+    bl_idname = "anim.clear_all"
+    bl_label = "Clear All"
+    bl_description = "Clear cache for all cached objects"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        cleared_count = 0
+        
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH':
+                continue
+            
+            settings = obj.cache_settings
+            if settings.state in ('READY', 'BAKING', 'DIRTY', 'ERROR'):
+                # Use the existing clear logic
+                if obj.name in g_worker.active_jobs:
+                    manager = g_worker.active_jobs[obj.name]
+                    manager.cleanup_temp()
+                    del g_worker.active_jobs[obj.name]
+                
+                g_worker.bake_queue = [(o, f) for o, f in g_worker.bake_queue if o != obj.name]
+                
+                if settings.cache_file_path:
+                    cache_path = Path(settings.cache_file_path)
+                    if cache_path.exists():
+                        cache_path.unlink()
+                    meta_path = cache_path.with_suffix('.json')
+                    if meta_path.exists():
+                        meta_path.unlink()
+                
+                for mod in obj.modifiers:
+                    if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+                        obj.modifiers.remove(mod)
+                
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE':
+                        mod.show_viewport = True
+                
+                settings.state = 'NONE'
+                settings.progress = 0.0
+                settings.cache_file_path = ""
+                settings.error_message = ""
+                cleared_count += 1
+        
+        self.report({'INFO'}, f"Cleared {cleared_count} caches")
+        return {'FINISHED'}
+
+
 # ============================================================================
 # UI PANEL
 # ============================================================================
@@ -848,6 +965,239 @@ class ANIM_PT_cache_panel(Panel):
                 box.alert = True
                 box.label(text="Animation changed", icon='ERROR')
                 box.operator("anim.bake_cache", text="Rebake Now", icon='FILE_REFRESH')
+
+
+class BB_PT_cache_npanel(Panel):
+    """BB Cache Animation N-Panel"""
+    bl_label = "BB Cache Animation"
+    bl_idname = "BB_PT_cache_npanel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Animation'
+    
+    def draw(self, context):
+        layout = self.layout
+        scene_settings = context.scene.bb_cache_settings
+        
+        # Global settings header
+        box = layout.box()
+        col = box.column(align=True)
+        
+        # Cache directory
+        col.prop(scene_settings, "cache_directory", text="")
+        
+        # Frame range
+        row = col.row(align=True)
+        row.prop(scene_settings, "frame_start")
+        row.prop(scene_settings, "frame_end")
+        row.operator("anim.sync_frame_range_global", text="", icon='TIME')
+        
+        # Batch operations
+        row = layout.row(align=True)
+        row.scale_y = 1.2
+        row.operator("anim.bake_all", text="Bake All", icon='RENDER_ANIMATION')
+        row.operator("anim.clear_all", text="Clear All", icon='TRASH')
+        
+        layout.separator()
+        
+        # List all armatures and their meshes
+        armatures = [obj for obj in bpy.data.objects if obj.type == 'ARMATURE']
+        
+        if not armatures:
+            layout.label(text="No armatures in scene", icon='INFO')
+            return
+        
+        for armature in armatures:
+            # Find meshes rigged to this armature
+            rigged_meshes = []
+            for obj in bpy.data.objects:
+                if obj.type != 'MESH':
+                    continue
+                
+                # Check if rigged to this armature
+                if obj.parent == armature:
+                    rigged_meshes.append(obj)
+                    continue
+                
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object == armature:
+                        rigged_meshes.append(obj)
+                        break
+            
+            if not rigged_meshes:
+                continue
+            
+            # No armature header - just list the meshes directly
+            for mesh_obj in rigged_meshes:
+                self.draw_mesh_row(layout, mesh_obj, context)
+        
+        # Force UI refresh if any object is baking
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and obj.cache_settings.state == 'BAKING':
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+                break
+    
+    def draw_mesh_row(self, layout, obj, context):
+        """Draw a single mesh row with status and buttons"""
+        settings = obj.cache_settings
+        
+        row = layout.row(align=True)
+        
+        # Show progress percentage if baking, otherwise just mesh name
+        if settings.state == 'BAKING':
+            progress = int(settings.progress * 100)
+            row.label(text=f"{obj.name} ({progress}%)")
+        else:
+            row.label(text=obj.name)
+        
+        # Buttons (icons only)
+        if settings.state == 'BAKING':
+            # Stop button while baking
+            op = row.operator("anim.stop_cache", text="", icon='PAUSE')
+            # Disable other buttons
+            row.label(text="", icon='BLANK1')
+            row.label(text="", icon='BLANK1')
+            row.label(text="", icon='BLANK1')
+        else:
+            # Bake button
+            op = row.operator("anim.bake_cache_single", text="", icon='FILE_REFRESH')
+            op.object_name = obj.name
+            
+            # Clear button (only if cached)
+            if settings.state in ('READY', 'DIRTY', 'ERROR'):
+                op = row.operator("anim.clear_cache_single", text="", icon='TRASH')
+                op.object_name = obj.name
+            else:
+                row.label(text="", icon='BLANK1')
+            
+            # Live Rig / Cache buttons (only if cached)
+            if settings.state in ('READY', 'DIRTY'):
+                # Live Rig button
+                op = row.operator("anim.set_playback_mode_single", text="", icon='ARMATURE_DATA', 
+                                 depress=not settings.use_cached_playback)
+                op.object_name = obj.name
+                op.mode = 'LIVE'
+                
+                # Cache button  
+                op = row.operator("anim.set_playback_mode_single", text="", icon='PLAY',
+                                 depress=settings.use_cached_playback)
+                op.object_name = obj.name
+                op.mode = 'CACHE'
+            else:
+                row.label(text="", icon='BLANK1')
+                row.label(text="", icon='BLANK1')
+
+
+# Single-object operators for N-panel
+class ANIM_OT_bake_cache_single(Operator):
+    """Bake cache for specific object"""
+    bl_idname = "anim.bake_cache_single"
+    bl_label = "Bake Cache"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    object_name: StringProperty()
+    
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.object_name)
+        if not obj:
+            return {'CANCELLED'}
+        
+        scene_settings = context.scene.bb_cache_settings
+        settings = obj.cache_settings
+        
+        # Use global settings
+        settings.cache_path = scene_settings.cache_directory
+        settings.frame_start = scene_settings.frame_start
+        settings.frame_end = scene_settings.frame_end
+        
+        g_worker.start_cache_job(obj)
+        return {'FINISHED'}
+
+
+class ANIM_OT_clear_cache_single(Operator):
+    """Clear cache for specific object"""
+    bl_idname = "anim.clear_cache_single"
+    bl_label = "Clear Cache"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    object_name: StringProperty()
+    
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.object_name)
+        if not obj:
+            return {'CANCELLED'}
+        
+        settings = obj.cache_settings
+        
+        # Use existing clear logic
+        if obj.name in g_worker.active_jobs:
+            manager = g_worker.active_jobs[obj.name]
+            manager.cleanup_temp()
+            del g_worker.active_jobs[obj.name]
+        
+        g_worker.bake_queue = [(o, f) for o, f in g_worker.bake_queue if o != obj.name]
+        
+        if settings.cache_file_path:
+            cache_path = Path(settings.cache_file_path)
+            if cache_path.exists():
+                cache_path.unlink()
+            meta_path = cache_path.with_suffix('.json')
+            if meta_path.exists():
+                meta_path.unlink()
+        
+        for mod in obj.modifiers:
+            if mod.type == 'MESH_CACHE' and mod.name.startswith("AnimCache_"):
+                obj.modifiers.remove(mod)
+        
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE':
+                mod.show_viewport = True
+        
+        settings.state = 'NONE'
+        settings.progress = 0.0
+        settings.cache_file_path = ""
+        settings.error_message = ""
+        
+        return {'FINISHED'}
+
+
+class ANIM_OT_set_playback_mode_single(Operator):
+    """Set playback mode for specific object"""
+    bl_idname = "anim.set_playback_mode_single"
+    bl_label = "Set Playback Mode"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    object_name: StringProperty()
+    mode: EnumProperty(
+        items=[
+            ('LIVE', "Live Rig", ""),
+            ('CACHE', "Cache", ""),
+        ]
+    )
+    
+    def execute(self, context):
+        obj = bpy.data.objects.get(self.object_name)
+        if not obj:
+            return {'CANCELLED'}
+        
+        settings = obj.cache_settings
+        settings.use_cached_playback = (self.mode == 'CACHE')
+        return {'FINISHED'}
+
+
+class ANIM_OT_sync_frame_range_global(Operator):
+    """Sync global frame range from timeline"""
+    bl_idname = "anim.sync_frame_range_global"
+    bl_label = "Sync Frame Range"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene_settings = context.scene.bb_cache_settings
+        scene_settings.frame_start = context.scene.frame_start
+        scene_settings.frame_end = context.scene.frame_end
+        return {'FINISHED'}
 
 
 # ============================================================================
@@ -1085,6 +1435,7 @@ def depsgraph_update_handler(scene, depsgraph):
 
 classes = (
     AnimCacheSettings,
+    BBCacheSceneSettings,
     ANIM_OT_bake_cache,
     ANIM_OT_stop_cache,
     ANIM_OT_clear_cache,
@@ -1092,7 +1443,14 @@ classes = (
     ANIM_OT_sync_frame_range,
     ANIM_OT_check_dirty,
     ANIM_OT_force_refresh,
+    ANIM_OT_bake_all,
+    ANIM_OT_clear_all,
+    ANIM_OT_bake_cache_single,
+    ANIM_OT_clear_cache_single,
+    ANIM_OT_set_playback_mode_single,
+    ANIM_OT_sync_frame_range_global,
     ANIM_PT_cache_panel,
+    BB_PT_cache_npanel,
 )
 
 
@@ -1101,8 +1459,9 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     
-    # Add property to objects
+    # Add properties
     bpy.types.Object.cache_settings = PointerProperty(type=AnimCacheSettings)
+    bpy.types.Scene.bb_cache_settings = PointerProperty(type=BBCacheSceneSettings)
     
     # Subscribe to mode changes via msgbus ONLY (immediate detection)
     setup_msgbus_subscriptions()
@@ -1117,8 +1476,9 @@ def unregister():
         if bpy.app.timers.is_registered(g_worker.idle_worker):
             bpy.app.timers.unregister(g_worker.idle_worker)
     
-    # Remove property from objects
+    # Remove properties
     del bpy.types.Object.cache_settings
+    del bpy.types.Scene.bb_cache_settings
     
     # Unregister classes
     for cls in reversed(classes):

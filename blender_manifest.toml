@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "bb_CacheAnimation"
+version = "1.2.0"
+name = "BB Cache Animation"
+tagline = "Caching system for animation"
+maintainer = "Blender Bob & Claude.ai"
+type = "add-on"
+
+tags = ["Animation"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
