@@ -1,10 +1,10 @@
 bl_info = {
     "name": "BB Cache Animation",
-    "author": "Your Name",
-    "version": (2, 0, 0),
-    "blender": (5, 0, 0),
-    "location": "View3D > N-Panel > Animation > BB Cache",
-    "description": "Maya-style animation caching for multiple characters",
+    "author": "Blender Bob & Claude.ai",
+    "version": (1, 0, 0),
+    "blender": (4, 5, 0),
+    "location": "View3D > N-Panel > Animation > BB Cache Animation",
+    "description": "Animation caching for multiple characters",
     "category": "Animation",
 }
 
@@ -963,7 +963,7 @@ class ANIM_PT_cache_panel(Panel):
 
 class BB_PT_cache_npanel(Panel):
     """BB Cache Animation N-Panel"""
-    bl_label = "BB Cache"
+    bl_label = "BB Cache Animation"
     bl_idname = "BB_PT_cache_npanel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
