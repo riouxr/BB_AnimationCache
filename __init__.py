@@ -8,6 +8,29 @@ bl_info = {
     "category": "Animation",
 }
 
+"""
+BB Cache Animation - Maya-style animation caching for Blender
+
+This addon provides high-performance animation caching for rigged characters:
+- Background baking using MDD format (one frame at a time, non-blocking)
+- Automatic cache disable/enable when entering/exiting Pose Mode
+- Multi-character workflow via N-panel interface
+- Dirty detection via animation data hashing
+- Frame restoration after baking
+
+Workflow:
+1. Rig your character(s) with armatures
+2. Open N-panel > Animation > BB Cache
+3. Click "Bake All" or individual bake buttons
+4. Cache plays back instantly; enter Pose Mode to edit, exit to auto-rebuild
+
+Architecture:
+- MDDCacheManager: Handles MDD file I/O and frame caching
+- BackgroundCacheWorker: Async baking via timer (g_worker singleton)
+- CacheDirtyTracker: Detects animation changes via hashing
+- Mode handlers: Auto-disable cache in Pose Mode via msgbus
+"""
+
 import bpy
 import struct
 import numpy as np
@@ -329,13 +352,15 @@ class BackgroundCacheWorker:
                 obj.cache_settings.cache_file_path = result
                 
                 # Check if this was an auto-rebuild that needs cache re-enabled
-                
                 if obj.name in _auto_reenable_cache:
                     obj.cache_settings.use_cached_playback = True
                     _auto_reenable_cache.discard(obj.name)
                 else:
                     # AUTO-ENABLE cached playback after manual baking
                     obj.cache_settings.use_cached_playback = True
+                
+                # Clean up stale entries for deleted objects
+                _auto_reenable_cache = {name for name in _auto_reenable_cache if name in bpy.data.objects}
                 
                 manager.cleanup_temp()
             else:
@@ -375,19 +400,6 @@ def apply_mesh_cache_modifier(obj, cache_path):
     cache_mod.frame_start = obj.cache_settings.frame_start
     cache_mod.forward_axis = 'POS_Y'
     cache_mod.up_axis = 'POS_Z'
-    # Don't set flip_axis - leave it as default empty set
-    
-    # Disable armature modifier during cached playback
-    if obj.cache_settings.use_cached_playback:
-        for mod in obj.modifiers:
-            if mod.type == 'ARMATURE':
-                mod.show_viewport = False
-        cache_mod.show_viewport = True
-    else:
-        for mod in obj.modifiers:
-            if mod.type == 'ARMATURE':
-                mod.show_viewport = True
-        cache_mod.show_viewport = False
 
 
 def get_default_cache_path():
@@ -397,6 +409,37 @@ def get_default_cache_path():
         return str(blend_dir / "cache")
     else:
         return "//cache"
+
+
+def bake_object_cache(obj, context):
+    """
+    Unified function to bake cache for an object.
+    Used by all bake operators to ensure consistency.
+    Returns (success, message)
+    """
+    if not obj or obj.type != 'MESH':
+        return False, "Object must be a mesh"
+    
+    settings = obj.cache_settings
+    scene_settings = context.scene.bb_cache_settings
+    
+    # Use scene settings if available, otherwise defaults
+    if scene_settings.cache_directory:
+        settings.cache_path = scene_settings.cache_directory
+    elif not settings.cache_path:
+        settings.cache_path = get_default_cache_path()
+    
+    # Set frame range from scene settings or timeline
+    settings.frame_start = scene_settings.frame_start if scene_settings.frame_start > 0 else context.scene.frame_start
+    settings.frame_end = scene_settings.frame_end if scene_settings.frame_end > 0 else context.scene.frame_end
+    
+    # Compute hash for dirty detection
+    settings.last_hash = CacheDirtyTracker.compute_hash(obj)
+    
+    # Start baking job
+    g_worker.start_cache_job(obj)
+    
+    return True, f"Started baking cache for {obj.name}"
 
 
 # ============================================================================
@@ -540,26 +583,14 @@ class ANIM_OT_bake_cache(Operator):
     
     def execute(self, context):
         obj = context.object
-        settings = obj.cache_settings
+        success, message = bake_object_cache(obj, context)
         
-        # Set defaults if needed
-        if not settings.cache_path:
-            settings.cache_path = get_default_cache_path()
-        
-        scene = context.scene
-        if settings.frame_start == 0:
-            settings.frame_start = scene.frame_start
-        if settings.frame_end == 0:
-            settings.frame_end = scene.frame_end
-        
-        # Compute hash
-        settings.last_hash = CacheDirtyTracker.compute_hash(obj)
-        
-        # Start job
-        g_worker.start_cache_job(obj)
-        
-        self.report({'INFO'}, f"Started baking cache for {obj.name}")
-        return {'FINISHED'}
+        if success:
+            self.report({'INFO'}, message)
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
 
 
 class ANIM_OT_clear_cache(Operator):
@@ -775,7 +806,6 @@ class ANIM_OT_bake_all(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
-        scene_settings = context.scene.bb_cache_settings
         baked_count = 0
         
         # Find all mesh objects with armature modifiers
@@ -788,15 +818,10 @@ class ANIM_OT_bake_all(Operator):
             if not has_armature:
                 continue
             
-            # Set frame range from scene settings
-            settings = obj.cache_settings
-            settings.cache_path = scene_settings.cache_directory
-            settings.frame_start = scene_settings.frame_start
-            settings.frame_end = scene_settings.frame_end
-            
-            # Start baking
-            g_worker.start_cache_job(obj)
-            baked_count += 1
+            # Use unified bake function
+            success, message = bake_object_cache(obj, context)
+            if success:
+                baked_count += 1
         
         self.report({'INFO'}, f"Started baking {baked_count} objects")
         return {'FINISHED'}
@@ -1098,16 +1123,13 @@ class ANIM_OT_bake_cache_single(Operator):
         if not obj:
             return {'CANCELLED'}
         
-        scene_settings = context.scene.bb_cache_settings
-        settings = obj.cache_settings
+        success, message = bake_object_cache(obj, context)
         
-        # Use global settings
-        settings.cache_path = scene_settings.cache_directory
-        settings.frame_start = scene_settings.frame_start
-        settings.frame_end = scene_settings.frame_end
-        
-        g_worker.start_cache_job(obj)
-        return {'FINISHED'}
+        if success:
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
 
 
 class ANIM_OT_clear_cache_single(Operator):
@@ -1321,7 +1343,7 @@ def check_mode_changes():
                             if _was_cache_enabled.get(child.name, False):
                                 # Mark for re-enabling after rebuild
                                 _auto_reenable_cache.add(child.name)
-                                g_worker.start_cache_job(child)
+                                bake_object_cache(child, bpy.context)
                                 # Clear the flag
                                 _was_cache_enabled.pop(child.name, None)
             
@@ -1332,9 +1354,6 @@ def check_mode_changes():
         _mode_check_running = False
 
 @bpy.app.handlers.persistent
-def dummy_handler(scene):
-    """Dummy handler - not used, but kept for compatibility"""
-    pass
 
 
 def setup_msgbus_subscriptions():
@@ -1363,6 +1382,11 @@ def cleanup_orphaned_temp_files():
                 continue
             
             settings = obj.cache_settings
+            
+            # Skip if currently baking
+            if settings.state == 'BAKING':
+                continue
+            
             if settings.cache_path:
                 cache_dir = Path(bpy.path.abspath(settings.cache_path))
                 temp_dir = cache_dir / ".temp"
