@@ -8,29 +8,6 @@ bl_info = {
     "category": "Animation",
 }
 
-"""
-BB Cache Animation - Maya-style animation caching for Blender
-
-This addon provides high-performance animation caching for rigged characters:
-- Background baking using MDD format (one frame at a time, non-blocking)
-- Automatic cache disable/enable when entering/exiting Pose Mode
-- Multi-character workflow via N-panel interface
-- Dirty detection via animation data hashing
-- Frame restoration after baking
-
-Workflow:
-1. Rig your character(s) with armatures
-2. Open N-panel > Animation > BB Cache
-3. Click "Bake All" or individual bake buttons
-4. Cache plays back instantly; enter Pose Mode to edit, exit to auto-rebuild
-
-Architecture:
-- MDDCacheManager: Handles MDD file I/O and frame caching
-- BackgroundCacheWorker: Async baking via timer (g_worker singleton)
-- CacheDirtyTracker: Detects animation changes via hashing
-- Mode handlers: Auto-disable cache in Pose Mode via msgbus
-"""
-
 import bpy
 import struct
 import numpy as np
@@ -1002,8 +979,10 @@ class BB_PT_cache_npanel(Panel):
         box = layout.box()
         col = box.column(align=True)
         
-        # Cache directory
-        col.prop(scene_settings, "cache_directory", text="")
+        # Cache directory - use placeholder to show default
+        col.label(text="Cache Directory:")
+        row = col.row(align=True)
+        row.prop(scene_settings, "cache_directory", text="", placeholder="//cache")
         
         # Frame range
         row = col.row(align=True)
@@ -1354,6 +1333,9 @@ def check_mode_changes():
         _mode_check_running = False
 
 @bpy.app.handlers.persistent
+def dummy_handler(scene):
+    """Dummy handler - not used, but kept for compatibility"""
+    pass
 
 
 def setup_msgbus_subscriptions():
@@ -1432,7 +1414,10 @@ def register():
     bpy.types.Scene.bb_cache_settings = PointerProperty(type=BBCacheSceneSettings)
     
     # Clean up any leftover temp files from previous crashes/interruptions
-    cleanup_orphaned_temp_files()
+    try:
+        cleanup_orphaned_temp_files()
+    except:
+        pass  # Ignore errors during cleanup
     
     # Subscribe to mode changes via msgbus ONLY (immediate detection)
     setup_msgbus_subscriptions()
